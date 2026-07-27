@@ -19,16 +19,20 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ChatService_StreamChat_FullMethodName = "/chat.ChatService/StreamChat"
+	ChatService_JoinChat_FullMethodName    = "/chat.ChatService/JoinChat"
+	ChatService_SendMessage_FullMethodName = "/chat.ChatService/SendMessage"
 )
 
 // ChatServiceClient is the client API for ChatService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// ChatService provides real-time messaging using a bidirectional stream.
+// ChatService provides real-time messaging compatible with web clients.
 type ChatServiceClient interface {
-	StreamChat(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ChatMessage, ChatMessage], error)
+	// JoinChat registers the user and opens a server-streaming channel to receive messages.
+	JoinChat(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChatMessage], error)
+	// SendMessage sends a single message to the server (Unary RPC).
+	SendMessage(ctx context.Context, in *ChatMessage, opts ...grpc.CallOption) (*Empty, error)
 }
 
 type chatServiceClient struct {
@@ -39,26 +43,45 @@ func NewChatServiceClient(cc grpc.ClientConnInterface) ChatServiceClient {
 	return &chatServiceClient{cc}
 }
 
-func (c *chatServiceClient) StreamChat(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ChatMessage, ChatMessage], error) {
+func (c *chatServiceClient) JoinChat(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChatMessage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &ChatService_ServiceDesc.Streams[0], ChatService_StreamChat_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &ChatService_ServiceDesc.Streams[0], ChatService_JoinChat_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[ChatMessage, ChatMessage]{ClientStream: stream}
+	x := &grpc.GenericClientStream[JoinRequest, ChatMessage]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ChatService_StreamChatClient = grpc.BidiStreamingClient[ChatMessage, ChatMessage]
+type ChatService_JoinChatClient = grpc.ServerStreamingClient[ChatMessage]
+
+func (c *chatServiceClient) SendMessage(ctx context.Context, in *ChatMessage, opts ...grpc.CallOption) (*Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Empty)
+	err := c.cc.Invoke(ctx, ChatService_SendMessage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 // ChatServiceServer is the server API for ChatService service.
 // All implementations must embed UnimplementedChatServiceServer
 // for forward compatibility.
 //
-// ChatService provides real-time messaging using a bidirectional stream.
+// ChatService provides real-time messaging compatible with web clients.
 type ChatServiceServer interface {
-	StreamChat(grpc.BidiStreamingServer[ChatMessage, ChatMessage]) error
+	// JoinChat registers the user and opens a server-streaming channel to receive messages.
+	JoinChat(*JoinRequest, grpc.ServerStreamingServer[ChatMessage]) error
+	// SendMessage sends a single message to the server (Unary RPC).
+	SendMessage(context.Context, *ChatMessage) (*Empty, error)
 	mustEmbedUnimplementedChatServiceServer()
 }
 
@@ -69,8 +92,11 @@ type ChatServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedChatServiceServer struct{}
 
-func (UnimplementedChatServiceServer) StreamChat(grpc.BidiStreamingServer[ChatMessage, ChatMessage]) error {
-	return status.Error(codes.Unimplemented, "method StreamChat not implemented")
+func (UnimplementedChatServiceServer) JoinChat(*JoinRequest, grpc.ServerStreamingServer[ChatMessage]) error {
+	return status.Error(codes.Unimplemented, "method JoinChat not implemented")
+}
+func (UnimplementedChatServiceServer) SendMessage(context.Context, *ChatMessage) (*Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method SendMessage not implemented")
 }
 func (UnimplementedChatServiceServer) mustEmbedUnimplementedChatServiceServer() {}
 func (UnimplementedChatServiceServer) testEmbeddedByValue()                     {}
@@ -93,12 +119,34 @@ func RegisterChatServiceServer(s grpc.ServiceRegistrar, srv ChatServiceServer) {
 	s.RegisterService(&ChatService_ServiceDesc, srv)
 }
 
-func _ChatService_StreamChat_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(ChatServiceServer).StreamChat(&grpc.GenericServerStream[ChatMessage, ChatMessage]{ServerStream: stream})
+func _ChatService_JoinChat_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(JoinRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ChatServiceServer).JoinChat(m, &grpc.GenericServerStream[JoinRequest, ChatMessage]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ChatService_StreamChatServer = grpc.BidiStreamingServer[ChatMessage, ChatMessage]
+type ChatService_JoinChatServer = grpc.ServerStreamingServer[ChatMessage]
+
+func _ChatService_SendMessage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ChatMessage)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ChatServiceServer).SendMessage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ChatService_SendMessage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ChatServiceServer).SendMessage(ctx, req.(*ChatMessage))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 // ChatService_ServiceDesc is the grpc.ServiceDesc for ChatService service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -106,13 +154,17 @@ type ChatService_StreamChatServer = grpc.BidiStreamingServer[ChatMessage, ChatMe
 var ChatService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "chat.ChatService",
 	HandlerType: (*ChatServiceServer)(nil),
-	Methods:     []grpc.MethodDesc{},
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "SendMessage",
+			Handler:    _ChatService_SendMessage_Handler,
+		},
+	},
 	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "StreamChat",
-			Handler:       _ChatService_StreamChat_Handler,
+			StreamName:    "JoinChat",
+			Handler:       _ChatService_JoinChat_Handler,
 			ServerStreams: true,
-			ClientStreams: true,
 		},
 	},
 	Metadata: "proto/chat.proto",

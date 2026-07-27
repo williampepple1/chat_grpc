@@ -29,8 +29,8 @@ func main() {
 		log.Fatalf("username cannot be empty")
 	}
 
-	// Connect to gRPC server
-	serverAddr := "localhost:50051"
+	// Connect to gRPC-Web / standard gRPC server on port 8080
+	serverAddr := "localhost:8080"
 	conn, err := grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
@@ -38,22 +38,14 @@ func main() {
 	defer conn.Close()
 
 	client := pb.NewChatServiceClient(conn)
-	stream, err := client.StreamChat(context.Background())
+
+	// Call JoinChat (Server-Streaming RPC) to connect and start receiving messages
+	stream, err := client.JoinChat(context.Background(), &pb.JoinRequest{User: username})
 	if err != nil {
-		log.Fatalf("failed to open stream: %v", err)
+		log.Fatalf("failed to join chat: %v", err)
 	}
 
-	// Send initial message to register username
-	err = stream.Send(&pb.ChatMessage{
-		User:      username,
-		Message:   "",
-		Timestamp: time.Now().Unix(),
-	})
-	if err != nil {
-		log.Fatalf("failed to register username: %v", err)
-	}
-
-	// Start a goroutine to receive messages from the server
+	// Start a goroutine to receive messages from the server stream
 	go func() {
 		for {
 			msg, err := stream.Recv()
@@ -75,7 +67,7 @@ func main() {
 		}
 	}()
 
-	// Read input from user and send to server
+	// Read input from user and send via SendMessage (Unary RPC)
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
 	for scanner.Scan() {
@@ -88,7 +80,8 @@ func main() {
 			break
 		}
 
-		err = stream.Send(&pb.ChatMessage{
+		// Send message using SendMessage (Unary call)
+		_, err = client.SendMessage(context.Background(), &pb.ChatMessage{
 			User:      username,
 			Message:   text,
 			Timestamp: time.Now().Unix(),

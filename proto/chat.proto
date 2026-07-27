@@ -4,14 +4,23 @@ package chat;
 
 option go_package = "chat_grpc/proto";
 
-// ChatService provides real-time messaging using a bidirectional stream.
+// ChatService provides real-time messaging compatible with web clients.
 service ChatService {
-  rpc StreamChat(stream ChatMessage) returns (stream ChatMessage);
+  // JoinChat registers the user and opens a server-streaming channel to receive messages.
+  rpc JoinChat(JoinRequest) returns (stream ChatMessage);
+
+  // SendMessage sends a single message to the server (Unary RPC).
+  rpc SendMessage(ChatMessage) returns (Empty);
 }
 
-// ChatMessage represents a message sent or received in the chat application.
+message JoinRequest {
+  string user = 1;
+}
+
 message ChatMessage {
   string user = 1;
   string message = 2;
   int64 timestamp = 3;
 }
+
+message Empty {}

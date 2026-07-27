@@ -1,0 +1,8 @@
+# Compiled binaries
+*.exe
+client.exe
+server.exe
+
+# Testing
+*.test
+*.out

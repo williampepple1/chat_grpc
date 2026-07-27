@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package chat;
+
+option go_package = "chat_grpc/proto";
+
+// ChatService provides real-time messaging using a bidirectional stream.
+service ChatService {
+  rpc StreamChat(stream ChatMessage) returns (stream ChatMessage);
+}
+
+// ChatMessage represents a message sent or received in the chat application.
+message ChatMessage {
+  string user = 1;
+  string message = 2;
+  int64 timestamp = 3;
+}

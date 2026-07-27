@@ -1,19 +1,110 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
 	pb "chat_grpc/proto"
 
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+var (
+	mongoClient *mongo.Client
+	msgCol      *mongo.Collection
+)
+
+// initMongo connects to the MongoDB instance and pings it to ensure connectivity.
+func initMongo() {
+	uri := os.Getenv("MONGODB_URI")
+	if uri == "" {
+		uri = "mongodb://localhost:27017"
+	}
+
+	log.Printf("Connecting to MongoDB at %s...", uri)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		log.Fatalf("failed to connect to MongoDB: %v", err)
+	}
+
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		log.Fatalf("failed to ping MongoDB: %v", err)
+	}
+
+	mongoClient = client
+	msgCol = client.Database("chat_db").Collection("messages")
+	log.Println("Successfully connected to MongoDB!")
+}
+
+// saveMessage inserts a message into MongoDB.
+func saveMessage(msg *pb.ChatMessage) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := msgCol.InsertOne(ctx, bson.M{
+		"user":      msg.User,
+		"message":   msg.Message,
+		"timestamp": msg.Timestamp,
+	})
+	if err != nil {
+		log.Printf("Error saving message to MongoDB: %v", err)
+	}
+}
+
+// sendHistory retrieves the last 50 messages from MongoDB and sends them to the stream.
+func sendHistory(stream pb.ChatService_StreamChatServer) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	opts := options.Find().
+		SetLimit(50).
+		SetSort(bson.M{"timestamp": -1})
+
+	cursor, err := msgCol.Find(ctx, bson.D{}, opts)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve history: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var dbMsgs []struct {
+		User      string `bson:"user"`
+		Message   string `bson:"message"`
+		Timestamp int64  `bson:"timestamp"`
+	}
+
+	if err := cursor.All(ctx, &dbMsgs); err != nil {
+		return fmt.Errorf("failed to decode history: %w", err)
+	}
+
+	// Send messages in chronological order (oldest first)
+	for i := len(dbMsgs) - 1; i >= 0; i-- {
+		chatMsg := &pb.ChatMessage{
+			User:      dbMsgs[i].User,
+			Message:   dbMsgs[i].Message,
+			Timestamp: dbMsgs[i].Timestamp,
+		}
+		if err := stream.Send(chatMsg); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
 
 type server struct {
 	pb.UnimplementedChatServiceServer
@@ -31,7 +122,6 @@ func newServer() *server {
 func (s *server) StreamChat(stream pb.ChatService_StreamChatServer) error {
 	var username string
 
-	// Loop to receive messages from the client
 	for {
 		msg, err := stream.Recv()
 		if err == io.EOF {
@@ -43,10 +133,8 @@ func (s *server) StreamChat(stream pb.ChatService_StreamChatServer) error {
 		}
 
 		s.mu.Lock()
-		// Register user on their first message
 		if username == "" {
 			username = msg.User
-			// Check if username is already taken
 			if _, exists := s.clients[username]; exists {
 				s.mu.Unlock()
 				errMsg := &pb.ChatMessage{
@@ -61,6 +149,11 @@ func (s *server) StreamChat(stream pb.ChatService_StreamChatServer) error {
 			log.Printf("User %s connected.", username)
 			s.mu.Unlock()
 
+			// Send message history to the newly connected user first
+			if err := sendHistory(stream); err != nil {
+				log.Printf("Failed to send history to %s: %v", username, err)
+			}
+
 			// Broadcast join message
 			s.broadcast(&pb.ChatMessage{
 				User:      "System",
@@ -71,12 +164,16 @@ func (s *server) StreamChat(stream pb.ChatService_StreamChatServer) error {
 		}
 		s.mu.Unlock()
 
+		// Save message to MongoDB (do not persist empty/system messages)
+		if msg.User != "System" && msg.Message != "" {
+			saveMessage(msg)
+		}
+
 		// Broadcast standard user message
 		log.Printf("[%s]: %s", msg.User, msg.Message)
 		s.broadcast(msg)
 	}
 
-	// Handle cleanup on disconnection
 	if username != "" {
 		s.mu.Lock()
 		delete(s.clients, username)
@@ -107,6 +204,18 @@ func (s *server) broadcast(msg *pb.ChatMessage) {
 }
 
 func main() {
+	// Initialize MongoDB connection
+	initMongo()
+	defer func() {
+		if mongoClient != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := mongoClient.Disconnect(ctx); err != nil {
+				log.Printf("Error disconnecting from MongoDB: %v", err)
+			}
+		}
+	}()
+
 	port := ":50051"
 	lis, err := net.Listen("tcp", port)
 	if err != nil {
